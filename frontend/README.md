@@ -1,4 +1,4 @@
-# PC Finder Frontend (Minimal + Premium)
+# PC Finder Frontend
 
 Vercel/Stripe-inspired dark UI + gradients, but kept to **very few code files**.
 
