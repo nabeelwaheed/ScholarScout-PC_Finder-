@@ -1,0 +1,197 @@
+﻿from __future__ import annotations
+from urllib.parse import urljoin, urlparse
+from bs4 import BeautifulSoup
+from typing import List, Dict, Tuple
+import re
+
+def norm_space(s: str) -> str:
+    import re as _re
+    return _re.sub(r"\s+", " ", (s or "").replace("\u00a0"," ").strip())
+
+# === PAPERS-ONLY filter ===
+# Keep only the Research Papers Program Committee.
+_PC_SLUG_HINTS = ("papers-program-committee",)
+
+_ORG_SLUG_HINTS = (
+    "organizing-committee",
+    "organising-committee",
+)
+
+class ResearchrScraper:
+    def __init__(self, base_url: str, http_client, delay_min: float, delay_max: float):
+        self.base = base_url.rstrip("/")
+        self.http = http_client
+        self.delay_min = delay_min
+        self.delay_max = delay_max
+
+    def _committee_candidates(self, conf: str, year: int, try_organising: bool) -> list[tuple[str,str]]:
+        cslug = f"{conf}-{year}"
+        out = []
+        # Organizing (keep as before)
+        out.append(("Organizing Committee", f"{self.base}/committee/{cslug}/{cslug}-organizing-committee"))
+        if try_organising:
+            out.append(("Organizing Committee", f"{self.base}/committee/{cslug}/{cslug}-organising-committee"))
+        # Program Committee — PAPERS ONLY
+        for hint in _PC_SLUG_HINTS:
+            out.append(("Program Committee", f"{self.base}/committee/{cslug}/{cslug}-{hint}"))
+        return out
+
+    def _slug_to_committee_label(self, slug: str) -> str | None:
+        s = slug.lower()
+        # papers-only
+        if "papers-program-committee" in s:
+            return "Program Committee"
+        if any(h in s for h in _ORG_SLUG_HINTS):
+            return "Organizing Committee"
+        return None
+
+    def _is_committee_path(self, path: str, conf: str, year: int) -> bool:
+        if not path: return False
+        parts = path.strip("/").split("/")
+        if len(parts) < 3: return False
+        if parts[0] != "committee": return False
+        if parts[1] != f"{conf}-{year}": return False
+        return self._slug_to_committee_label(parts[-1]) is not None
+
+    def find_all_committees(self, conf: str, year: int, try_organising: bool) -> list[tuple[str,str]]:
+        seen = set()
+        out: list[tuple[str,str]] = []
+        # 1) Try direct candidates
+        for label, url in self._committee_candidates(conf, year, try_organising):
+            self.http.polite_delay(self.delay_min, self.delay_max)
+            r = self.http.get(url)
+            if r.status_code == 200:
+                key = (label, url)
+                if key not in seen:
+                    seen.add(key); out.append((label, url))
+        # 2) Scan home pages; accept ONLY papers-program-committee
+        for home in [f"{self.base}/home/{conf}-{year}", f"{self.base}/{conf}-{year}"]:
+            self.http.polite_delay(self.delay_min, self.delay_max)
+            r = self.http.get(home)
+            if r.status_code != 200:
+                continue
+            soup = BeautifulSoup(r.text, "lxml")
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                full = urljoin(self.base, href)
+                path = urlparse(full).path
+                if self._is_committee_path(path, conf, year):
+                    label = self._slug_to_committee_label(path.strip("/").split("/")[-1])
+                    if label:
+                        key = (label, full)
+                        if key not in seen:
+                            seen.add(key); out.append((label, full))
+        return out
+
+    def fetch_profile_details(self, profile_url: str, conf: str, year: int):
+        from bs4 import BeautifulSoup as _BS
+        import re as _re
+        self.http.polite_delay(self.delay_min, self.delay_max)
+        r = self.http.get(profile_url)
+        if r.status_code != 200:
+            return "", "", [], "", ""
+        soup = _BS(r.text, "lxml")
+
+        def extract_label(label: str) -> str:
+            lab = label.lower()
+            for dt in soup.find_all("dt"):
+                head = (dt.get_text(" ", strip=True) or "").lower().rstrip(": ")
+                if head == lab or lab in head:
+                    dd = dt.find_next_sibling("dd")
+                    if dd:
+                        return norm_space(dd.get_text(" ", strip=True))
+            for tag in soup.find_all(["p", "div", "li"]):
+                strong = tag.find(["strong", "b"])
+                if strong:
+                    head = (strong.get_text(" ", strip=True) or "").lower().rstrip(": ")
+                    if head == lab or lab in head:
+                        text = tag.get_text(" ", strip=True)
+                        m = _re.search(rf"(?i)\b{_re.escape(label)}\s*[:：]\s*(.+)$", text)
+                        if m:
+                            return norm_space(m.group(1))
+            txt = soup.find(string=_re.compile(rf"(?i)\b{_re.escape(label)}\s*[:：]"))
+            if txt and getattr(txt, "parent", None):
+                text = txt.parent.get_text(" ", strip=True)
+                m = _re.search(rf"(?i)\b{_re.escape(label)}\s*[:：]\s*(.+)$", text)
+                if m:
+                    return norm_space(m.group(1))
+            plaintext = soup.get_text("\n", strip=True)
+            m = _re.search(rf"(?mi)^\s*{_re.escape(label)}\s*[:：]\s*(.+)$", plaintext)
+            if m:
+                return norm_space(m.group(1))
+            return ""
+
+        name = extract_label("Name")
+        if not name and soup.find("h1"):
+            name = norm_space(soup.find("h1").get_text(" ", strip=True))
+
+        bio = extract_label("Bio")
+        if not bio:
+            ps = [norm_space(p.get_text(" ", strip=True)) for p in soup.find_all("p")]
+            long_ps = [p for p in ps if len(p) > 120]
+            if long_ps:
+                bio = long_ps[0]
+
+        affiliation = extract_label("Affiliation")
+        country = extract_label("Country")
+
+        def split_interests(text: str) -> list[str]:
+            if not text: return []
+            parts = [p.strip() for p in re.split(r"[;,]", text) if p.strip()]
+            out, seen = [], set()
+            for p in parts:
+                p = re.sub(r"^\band\b\s+", "", p, flags=re.I).rstrip(".")
+                p = norm_space(p)
+                p = re.sub(r"\bsoftware analytic\b", "software analytics", p, flags=re.I)
+                k = p.lower()
+                if p and k not in seen:
+                    seen.add(k); out.append(p)
+            return out
+
+        ri_text = extract_label("Research interests")
+        interests = split_interests(ri_text)
+
+        if not interests and bio:
+            m = re.search(
+                r"(?is)\bresearch\s*interests?\s*(?:are|include|focus(?:es)?\s+on)?\s*[:：]?\s*(.+?)(?:\.|$)",
+                bio
+            )
+            if m:
+                interests = split_interests(m.group(1))
+
+        return name, bio, interests, affiliation, country
+
+    def parse_committee(self, committee_url: str, conf: str, year: int, committee_label: str):
+        from bs4 import BeautifulSoup as _BS
+        self.http.polite_delay(self.delay_min, self.delay_max)
+        r = self.http.get(committee_url)
+        if r.status_code != 200:
+            return []
+        soup = _BS(r.text, "lxml")
+        out = []
+        for a in soup.select("a[href*='/profile/']"):
+            profile_url = urljoin(self.base, a.get("href", ""))
+            if not profile_url:
+                continue
+            name, bio, interests, affiliation, country = self.fetch_profile_details(profile_url, conf, year)
+            if not name:
+                name = norm_space(a.get_text(" ", strip=True).split(" - ")[0].split("|")[0].split(":")[0])
+            out.append({
+                "conference": conf.upper(),
+                "year": year,
+                "committee": committee_label,
+                "name": name,
+                "affiliation": affiliation,
+                "country": country,
+                "bio": bio,
+                "research_interests": interests,
+                "person_profile_url": profile_url,
+                "committee_page_url": committee_url,
+            })
+        seen=set(); uniq=[]
+        for r in out:
+            key=(r["conference"], r["year"], r.get("committee"), r["name"], r["person_profile_url"])
+            if key in seen: continue
+            seen.add(key); uniq.append(r)
+        return uniq
+
